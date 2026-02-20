@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="pt">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Trading Arena</title>
+
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-icon">⚔️</span>
+      <span class="brand-title">Trading Arena</span>
+    </div>
+
+    <div class="topbar-right">
+      <div class="pill" id="phasePill">LOADING…</div>
+      <button class="btn btn-ghost" id="btnOpenJoin">Entrar</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel panel-chart">
+      <div id="chart" class="chart"></div>
+    </section>
+
+    <aside class="panel panel-side">
+
+      <!-- Identidade do jogador -->
+      <div class="card">
+        <div class="card-title">Jogador</div>
+        <div class="kv">
+          <span class="k">Nick</span>
+          <span class="v" id="meNick">—</span>
+        </div>
+        <div class="kv">
+          <span class="k">Código</span>
+          <span class="v mono" id="meCode">—</span>
+        </div>
+
+        <div class="row-actions">
+          <button class="btn" id="btnResetMe">Trocar jogador</button>
+        </div>
+      </div>
+
+      <!-- Mercado -->
+      <div class="card">
+        <div class="card-title">Mercado</div>
+
+        <div class="kv">
+          <span class="k">Status</span>
+          <span class="v" id="status">—</span>
+        </div>
+
+        <div class="kv">
+          <span class="k">Preço (RICH/USD)</span>
+          <span class="v" id="price">—</span>
+        </div>
+
+        <div class="row-actions">
+          <button class="btn" id="reload">Recarregar candles</button>
+        </div>
+
+
+      <!-- Conta -->
+      <div class="card">
+        <div class="card-title">Conta</div>
+
+        <div class="kv">
+          <span class="k">Saldo (USD)</span>
+          <span class="v" id="meCash">—</span>
+        </div>
+
+        <div class="kv">
+          <span class="k">Posição (RICH)</span>
+          <span class="v" id="mePos">—</span>
+        </div>
+
+        <div class="kv">
+          <span class="k">Preço Médio</span>
+          <span class="v" id="meAvgPrice">—</span>
+        </div>
+
+        <div class="kv">
+          <span class="k">Património (USD)</span>
+          <span class="v" id="meEquity">—</span>
+        </div>
+
+        <div class="kv">
+          <span class="k">PnL Aberto</span>
+          <span class="v" id="mePnlUnrealized">—</span>
+        </div>
+
+        <div class="kv">
+          <span class="k">PnL Realizado</span>
+          <span class="v" id="mePnlRealized">—</span>
+        </div>
+
+        <div class="kv">
+          <span class="k">PnL Total</span>
+          <span class="v" id="mePnlTotal">—</span>
+        </div>
+
+        <div class="hint">
+          (Em breve) PnL e Preço Médio serão calculados e exibidos aqui.
+        </div>
+      </div>
+
+      <!-- Posição Aberta -->
+      <div class="card">
+        <div class="card-title">Posição Aberta</div>
+
+        <div class="kv">
+          <span class="k">Estado</span>
+          <span class="v" id="posState">—</span>
+        </div>
+
+        <div class="kv">
+          <span class="k">Tamanho</span>
+          <span class="v" id="posSize">—</span>
+        </div>
+
+        <div class="row-actions">
+          <button class="btn btn-sell" id="btnCloseAll">Fechar Posição</button>
+        </div>
+
+        <div class="hint">
+          Fechar posição vende 100% do RICH (spot-only) e volta para FLAT.
+        </div>
+      </div>
+
+      <!-- Trade -->
+      <div class="card">
+        <div class="card-title">Trade (Market)</div>
+
+        <label class="label">Quantidade (USD)</label>
+        <input class="input mono" id="qty" inputmode="decimal" placeholder="Ex: 25" />
+
+        <div class="grid2">
+          <button class="btn btn-buy" id="btnBuy">BUY</button>
+          <button class="btn btn-sell" id="btnSell">SELL</button>
+        </div>
+
+
+
+      <!-- Ranking -->
+      <div class="card">
+        <div class="card-title">Ranking (Equity)</div>
+
+        <div class="leaderboard" id="leaderboard">
+          <div class="empty" id="leaderboardEmpty">Ainda sem jogadores.</div>
+        </div>
+
+        <div class="hint">
+          Ordenado por património (USD). Em breve: métricas avançadas.
+        </div>
+      </div>
+
+      <!-- Histórico -->
+      <div class="card">
+        <div class="card-title">Histórico</div>
+
+        <div class="kv">
+          <span class="k">Compras</span>
+          <span class="v" id="buysCount">—</span>
+        </div>
+
+        <div class="trades" id="tradesBuys">
+          <div class="empty" id="tradesBuysEmpty">Em breve.</div>
+        </div>
+
+        <div class="kv" style="margin-top:10px;">
+          <span class="k">Vendas</span>
+          <span class="v" id="sellsCount">—</span>
+        </div>
+
+        <div class="trades" id="tradesSells">
+          <div class="empty" id="tradesSellsEmpty">Em breve.</div>
+        </div>
+
+        <div class="hint">
+          (Em breve) listagem real de trades e detalhes.
+        </div>
+      </div>
+
+    </aside>
+  </main>
+
+  <!-- MODAL JOIN -->
+  <div class="modal-backdrop" id="joinModal" aria-hidden="true">
+    <div class="modal">
+      <div class="modal-head">
+        <div class="modal-title">Entrar na Arena</div>
+        <button class="icon-btn" id="btnCloseJoin" aria-label="Fechar">✕</button>
+      </div>
+
+      <div class="modal-body">
+        <div class="hint">
+          Sem contas. Cada pessoa usa um <b>código</b> (secreto) e escolhe um <b>nick</b> (aparece no ranking).
+        </div>
+
+        <label class="label">Código do jogador</label>
+        <input class="input mono" id="joinCode" placeholder="Ex: ARTHUR-7F3K9D2A" />
+
+        <label class="label">Nick</label>
+        <input class="input" id="joinNick" placeholder="Ex: Arthur" />
+
+        <button class="btn" id="btnJoin">Entrar</button>
+
+        <div class="hint">
+          Ao entrar, o saldo inicial será <b>10.000</b>.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+  <script src="/static/js/app.js"></script>
+
+</body>
+</html>
