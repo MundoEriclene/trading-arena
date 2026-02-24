@@ -9,10 +9,25 @@ DB_PATH = APP_ROOT / "backend" / "db" / "game.db"
 
 def _connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH), timeout=5, isolation_level=None, check_same_thread=False)
+
+    # timeout maior ajuda muito com concorrência (muitos readers + alguns writers)
+    conn = sqlite3.connect(
+        str(DB_PATH),
+        timeout=30.0,
+        isolation_level=None,          # autocommit (bom para API)
+        check_same_thread=False,
+    )
     conn.row_factory = sqlite3.Row
+
+    # PRAGMAs: performance + concorrência
+    conn.execute("PRAGMA foreign_keys=ON;")
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    conn.execute("PRAGMA busy_timeout=5000;")  # 5s
+    # cache_size negativo => KB. Ex: -20000 ~ 20MB de cache (bom para leitura frequente)
+    conn.execute("PRAGMA cache_size=-20000;")
+
     return conn
 
 
@@ -56,6 +71,12 @@ def init_db() -> None:
                 k TEXT PRIMARY KEY,
                 v TEXT NOT NULL
             );
+
+            -- Índices críticos (performance real com 50 users)
+            CREATE INDEX IF NOT EXISTS idx_trades_code_id ON trades(code, id);
+            CREATE INDEX IF NOT EXISTS idx_trades_code_ts ON trades(code, ts);
+            CREATE INDEX IF NOT EXISTS idx_players_updated_at ON players(updated_at);
+            CREATE INDEX IF NOT EXISTS idx_candles_ts ON candles(ts);
             """
         )
 
@@ -158,6 +179,15 @@ def list_recent_trades(code: str, limit: int = 20) -> List[Dict[str, Any]]:
         return data
 
 
+def get_last_trade_id(code: str) -> int:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS last_id FROM trades WHERE code = ?",
+            (code,),
+        ).fetchone()
+        return int(row["last_id"] if row else 0)
+
+
 def upsert_candle(ts: int, o: float, h: float, l: float, c: float) -> None:
     with _connect() as conn:
         conn.execute(
@@ -195,5 +225,3 @@ def get_candles_since(ts_from: int, limit: int = 600) -> List[Dict[str, Any]]:
             (int(ts_from), int(limit)),
         ).fetchall()
         return [dict(r) for r in rows]
-
-

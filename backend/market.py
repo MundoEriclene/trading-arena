@@ -10,57 +10,33 @@ from backend import db
 
 @dataclass
 class MarketConfig:
-    # Candle para UI em tempo real (1s no DB; o frontend agrega em 5m)
     candle_seconds: int = 1
     tick_seconds: float = 1.0
 
-    # Preço inicial do ativo RICH/USD ao iniciar o jogo
     start_price: float = 100.0
-
-    # Liquidez inicial do pool (define "profundidade" / slippage)
     initial_usd_liquidity: float = 200_000.0
 
-    # Seed apenas visual (histórico)
     seed_enabled: bool = True
+    seed_seconds: int = 7 * 24 * 60 * 60
+    seed_candle_seconds: int = 60
+    seed_step_pct: float = 0.0007
 
-    # Queremos 1 semana de histórico "visível"
-    seed_seconds: int = 7 * 24 * 60 * 60  # 7 dias
-
-    # IMPORTANTÍSSIMO: seed mais leve (1 minuto) para não explodir DB
-    # (live continua em 1s via candle_seconds)
-    seed_candle_seconds: int = 60  # 1 minuto
-
-    # Volatilidade visual do seed (por candle de seed, ou seja, por 1 minuto)
-    seed_step_pct: float = 0.0007  # 0,07% por minuto (ajuste fino)
-
-    # Fees (0 para ficar "sanguinário" e simples)
     fee_rate: float = 0.0
 
-    # Margem / risco (para SHORT)
-    # equity = cash + pos * price
-    # Regra:
-    #   - equity_after tem de ser >= min_equity
-    #   - abs(pos_after)*price <= equity_after * leverage_max
     min_equity: float = 0.0
     leverage_max: float = 3.0
 
-    # Stop-out (opcional)
     stopout_equity: float = 0.0
 
 
 class MarketEngine:
     """
-    Motor do mercado usando AMM (x*y=k) com LONG + SHORT.
+    AMM (x*y=k) com LONG + SHORT.
 
-    Convenção:
-      - pos > 0  => LONG (tem RICH)
-      - pos = 0  => FLAT
-      - pos < 0  => SHORT (vendeu RICH "emprestado")
-
-    Importante:
-      - Depois do start_game(), preço só muda por trades.
-      - Seed é só visual: não cria trades nem mexe no pool.
-      - Seed de 1 semana é gerado em 1 MINUTO para performance.
+    Otimizações feitas:
+      - Conexão SQLite do engine com PRAGMAs (WAL/busy_timeout/cache).
+      - Seed em batch (uma conexão + transaction).
+      - Candle persist usando conexão do engine (evita abrir conexão por candle).
     """
 
     STATE_PRICE = "price"
@@ -69,8 +45,6 @@ class MarketEngine:
     STATE_POOL_Y = "pool_y"
     STATE_POOL_K = "pool_k"
     STATE_STARTED = "started"
-
-    # versão do seed (para não “prender” no seed antigo)
     STATE_SEEDED_TAG = "seeded_tag"
 
     def __init__(self, cfg: MarketConfig):
@@ -79,33 +53,39 @@ class MarketEngine:
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
 
-        # AMM pool
-        self.pool_x: float = 0.0  # RICH reserve
-        self.pool_y: float = 0.0  # USD reserve
+        self.pool_x: float = 0.0
+        self.pool_y: float = 0.0
         self.pool_k: float = 0.0
 
-        # price
         self.price: float = float(cfg.start_price)
 
-        # candle 1s (OHLC) para lightweight-charts
         self.candle_ts: int = 0
         self.candle_o: float = self.price
         self.candle_h: float = self.price
         self.candle_l: float = self.price
         self.candle_c: float = self.price
 
-        # started gate
         self.started: bool = False
 
     # ---------- DB helpers ----------
     def _conn(self) -> sqlite3.Connection:
+        # Conexão do engine com as mesmas PRAGMAs de performance do db.py
         c = sqlite3.connect(
             str(db.DB_PATH),
-            timeout=5,
+            timeout=30.0,
             isolation_level=None,
             check_same_thread=False,
         )
         c.row_factory = sqlite3.Row
+        try:
+            c.execute("PRAGMA foreign_keys=ON;")
+            c.execute("PRAGMA journal_mode=WAL;")
+            c.execute("PRAGMA synchronous=NORMAL;")
+            c.execute("PRAGMA temp_store=MEMORY;")
+            c.execute("PRAGMA busy_timeout=5000;")
+            c.execute("PRAGMA cache_size=-20000;")
+        except Exception:
+            pass
         return c
 
     def _get_state_float(self, key: str) -> Optional[float]:
@@ -138,14 +118,16 @@ class MarketEngine:
         if lev <= 0:
             return False
 
-        exposure = abs(pos_after) * price_after  # em USD
+        exposure = abs(pos_after) * price_after
         max_exposure = equity * lev
         return exposure <= (max_exposure + 1e-9)
 
     # ---------- Seed (histórico visual) ----------
     def _seed_tag(self) -> str:
-        # se mudar configs do seed, muda a tag automaticamente
-        return f"v2|secs={int(self.cfg.seed_seconds)}|cs={int(self.cfg.seed_candle_seconds)}|step={float(self.cfg.seed_step_pct):.8f}|p0={float(self.cfg.start_price):.6f}"
+        return (
+            f"v3|secs={int(self.cfg.seed_seconds)}|cs={int(self.cfg.seed_candle_seconds)}"
+            f"|step={float(self.cfg.seed_step_pct):.8f}|p0={float(self.cfg.start_price):.6f}"
+        )
 
     def _get_earliest_candle_ts(self) -> Optional[int]:
         conn = self._conn()
@@ -155,93 +137,83 @@ class MarketEngine:
         finally:
             conn.close()
 
-    def _get_latest_candle_ts(self) -> Optional[int]:
-        conn = self._conn()
-        try:
-            row = conn.execute("SELECT ts FROM candles ORDER BY ts DESC LIMIT 1").fetchone()
-            return int(row["ts"]) if row else None
-        finally:
-            conn.close()
-
     def seed_history_if_needed(self) -> None:
-        """
-        Gera/estende um histórico visual (random-walk suave) para cobrir 1 semana,
-        usando candles de seed em 1 minuto (leve).
-
-        Regras do seed:
-          - NÃO cria trades
-          - NÃO altera pool (pool só inicializa no start)
-          - NÃO destrói candles existentes: apenas estende para trás se faltar histórico.
-        """
         if not self.cfg.seed_enabled:
             return
 
+        # Se já está seedado com a mesma tag e DB já cobre o período, pula
         now = int(time.time())
-        target_start = now - int(self.cfg.seed_seconds)
-
         seed_cs = max(1, int(self.cfg.seed_candle_seconds))
+
+        target_start = now - int(self.cfg.seed_seconds)
         target_start = (target_start // seed_cs) * seed_cs
 
-        # Se já temos histórico suficiente, não faz nada
         earliest = self._get_earliest_candle_ts()
         if earliest is not None and earliest <= target_start:
-            # já cobre 1 semana (ou mais)
             db.set_state(self.STATE_SEEDED_TAG, self._seed_tag())
             return
 
-        # Define o ponto final do seed (onde vamos parar)
-        # - se já existe candle, paramos no earliest atual (para não colidir)
-        # - se não existe nada, paramos em "now" alinhado
+        # ponto final do seed (exclusivo)
         end_ts = earliest if earliest is not None else ((now // seed_cs) * seed_cs)
 
-        # Se for o primeiro seed, usa start_price como base.
-        # Se já existirem candles, usamos o close do primeiro candle existente como âncora.
+        # âncora de preço
         last_close = float(self.cfg.start_price)
         if earliest is not None:
-            # vamos “andar” até chegar no earliest; para isso precisamos de uma âncora
-            # pegamos o open do earliest candle como referência (mais coerente)
             conn = self._conn()
             try:
-                row = conn.execute(
-                    "SELECT open FROM candles WHERE ts = ? LIMIT 1", (earliest,)
-                ).fetchone()
+                row = conn.execute("SELECT open FROM candles WHERE ts = ? LIMIT 1", (earliest,)).fetchone()
                 if row:
                     last_close = float(row["open"])
             finally:
                 conn.close()
 
-        # Vamos gerar do target_start até end_ts (exclusivo), em seed_cs
-        # Random-walk com leve mean-reversion para não “fugir” do range.
-        # Observação: como estamos gerando para trás (antes do earliest), usamos uma
-        # lógica de drift normal, mas apenas gravamos candles para trás; visualmente fica bom.
-        for ts in range(target_start, int(end_ts), seed_cs):
-            step = random.uniform(-1.0, 1.0) * float(self.cfg.seed_step_pct)
+        # Seed em batch (muito mais rápido que abrir conexão por candle)
+        conn = self._conn()
+        try:
+            conn.execute("BEGIN;")
 
-            # mean-reversion suave em torno do start_price
-            mr = (float(self.cfg.start_price) - last_close) / float(self.cfg.start_price) * 0.015
+            for ts in range(int(target_start), int(end_ts), seed_cs):
+                step = random.uniform(-1.0, 1.0) * float(self.cfg.seed_step_pct)
+                mr = (float(self.cfg.start_price) - last_close) / float(self.cfg.start_price) * 0.015
+                ret = step + mr
+                close = max(0.0001, last_close * (1.0 + ret))
 
-            ret = step + mr
-            close = max(0.0001, last_close * (1.0 + ret))
+                o = last_close
+                h = max(o, close)
+                l = min(o, close)
 
-            o = last_close
-            h = max(o, close)
-            l = min(o, close)
+                conn.execute(
+                    """
+                    INSERT INTO candles(ts, open, high, low, close)
+                    VALUES(?,?,?,?,?)
+                    ON CONFLICT(ts) DO UPDATE SET
+                      open=excluded.open,
+                      high=excluded.high,
+                      low=excluded.low,
+                      close=excluded.close
+                    """,
+                    (int(ts), float(o), float(h), float(l), float(close)),
+                )
 
-            # grava candle (ts é a “abertura” do bucket do seed)
-            db.upsert_candle(ts=int(ts), o=float(o), h=float(h), l=float(l), c=float(close))
+                last_close = close
 
-            last_close = close
+            conn.execute("COMMIT;")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK;")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
 
         db.set_state(self.STATE_SEEDED_TAG, self._seed_tag())
 
     # ---------- Lifecycle ----------
     def init_or_load(self) -> None:
         db.init_db()
-
-        # 1) Seed visual (opcional) — agora 1 semana leve
         self.seed_history_if_needed()
 
-        # 2) Carrega último candle para price inicial do UI
         last = db.get_last_candle()
         with self._lock:
             if last:
@@ -260,7 +232,6 @@ class MarketEngine:
             st = db.get_state(self.STATE_STARTED)
             self.started = (st == "1")
 
-            # Recarrega pool (para reboot)
             x = self._get_state_float(self.STATE_POOL_X)
             y = self._get_state_float(self.STATE_POOL_Y)
             k = self._get_state_float(self.STATE_POOL_K)
@@ -286,10 +257,6 @@ class MarketEngine:
             self._thread.join(timeout=2)
 
     def start_game(self) -> Dict[str, Any]:
-        """
-        Inicializa o AMM pool e ativa started=1.
-        Depois disso, preço só muda por trades.
-        """
         with self._lock:
             if self.started and self.pool_x > 0 and self.pool_y > 0:
                 return self.snapshot()
@@ -345,12 +312,6 @@ class MarketEngine:
 
     # ---------- Core: Market Orders ----------
     def market_buy(self, code: str, usd_in: float) -> Dict[str, Any]:
-        """
-        BUY market:
-          - Player paga usd_in
-          - Recebe rich_out do pool
-          - Pode também fechar SHORT (pos negativa) automaticamente.
-        """
         code = str(code).strip()
         usd_in = float(usd_in)
         if not code:
@@ -367,10 +328,7 @@ class MarketEngine:
                 if self.pool_x <= 0 or self.pool_y <= 0 or self.pool_k <= 0:
                     return {"ok": False, "error": "pool inválido"}
 
-                row = conn.execute(
-                    "SELECT cash, pos FROM players WHERE code = ?",
-                    (code,),
-                ).fetchone()
+                row = conn.execute("SELECT cash, pos FROM players WHERE code = ?", (code,)).fetchone()
                 if not row:
                     return {"ok": False, "error": "player não existe"}
 
@@ -385,7 +343,6 @@ class MarketEngine:
                 if usd_effective <= 0:
                     return {"ok": False, "error": "usd_in pequeno demais (fee)"}
 
-                # AMM: Y' = Y + usd_effective ; X' = K / Y'
                 y_new = self.pool_y + usd_effective
                 x_new = self.pool_k / y_new
                 rich_out = self.pool_x - x_new
@@ -393,7 +350,7 @@ class MarketEngine:
                 if rich_out <= 0 or x_new <= 0:
                     return {"ok": False, "error": "liquidez insuficiente"}
 
-                # Atualiza pool / preço
+                # aplica pool
                 self.pool_y = float(y_new)
                 self.pool_x = float(x_new)
                 self.price = float(self.pool_y / self.pool_x)
@@ -402,11 +359,10 @@ class MarketEngine:
                 notional = float(usd_in)
 
                 cash_after = cash - usd_in
-                pos_after = pos + rich_out  # se pos era negativa (short), isto cobre
+                pos_after = pos + rich_out
 
-                # margem após
                 if not self._margin_ok(cash_after, pos_after, self.price):
-                    # reverte pool (porque estamos sob lock)
+                    # reverte pool
                     self.pool_y -= float(usd_effective)
                     self.pool_x += float(rich_out)
                     self.price = float(self.pool_y / self.pool_x)
@@ -421,13 +377,15 @@ class MarketEngine:
                     INSERT INTO trades (code, ts, side, qty, price, notional, fee, cash_after, pos_after)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (code, now, "BUY", float(rich_out), float(trade_price), float(notional), float(fee), float(cash_after), float(pos_after)),
+                    (
+                        code, now, "BUY",
+                        float(rich_out), float(trade_price), float(notional), float(fee),
+                        float(cash_after), float(pos_after)
+                    ),
                 )
 
-                self._touch_candle(now, self.price)
+                self._touch_candle_conn(conn, now, self.price)
                 self._set_pool_state()
-
-            conn.commit()
 
             return {
                 "ok": True,
@@ -445,12 +403,6 @@ class MarketEngine:
             conn.close()
 
     def market_sell(self, code: str, rich_in: float) -> Dict[str, Any]:
-        """
-        SELL market (com SHORT):
-          - Player vende rich_in (se tiver LONG) OU vende "emprestado" (abre short)
-          - Recebe usd_out do pool
-          - Preço cai conforme AMM
-        """
         code = str(code).strip()
         rich_in = float(rich_in)
         if not code:
@@ -467,17 +419,13 @@ class MarketEngine:
                 if self.pool_x <= 0 or self.pool_y <= 0 or self.pool_k <= 0:
                     return {"ok": False, "error": "pool inválido"}
 
-                row = conn.execute(
-                    "SELECT cash, pos FROM players WHERE code = ?",
-                    (code,),
-                ).fetchone()
+                row = conn.execute("SELECT cash, pos FROM players WHERE code = ?", (code,)).fetchone()
                 if not row:
                     return {"ok": False, "error": "player não existe"}
 
                 cash = float(row["cash"])
                 pos = float(row["pos"])
 
-                # AMM: X' = X + rich_in ; Y' = K / X'
                 x_new = self.pool_x + rich_in
                 y_new = self.pool_k / x_new
                 usd_out_gross = self.pool_y - y_new
@@ -490,7 +438,6 @@ class MarketEngine:
                 if usd_out <= 0:
                     return {"ok": False, "error": "resultado pequeno demais (fee)"}
 
-                # Atualiza pool / preço
                 self.pool_x = float(x_new)
                 self.pool_y = float(y_new)
                 self.price = float(self.pool_y / self.pool_x)
@@ -498,9 +445,8 @@ class MarketEngine:
                 trade_price = float(usd_out / rich_in)
                 notional = float(usd_out)
 
-                # SHORT permitido
                 cash_after = cash + usd_out
-                pos_after = pos - rich_in  # pode ir negativo
+                pos_after = pos - rich_in
 
                 if not self._margin_ok(cash_after, pos_after, self.price):
                     # reverte pool
@@ -518,13 +464,15 @@ class MarketEngine:
                     INSERT INTO trades (code, ts, side, qty, price, notional, fee, cash_after, pos_after)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (code, now, "SELL", float(rich_in), float(trade_price), float(notional), float(fee), float(cash_after), float(pos_after)),
+                    (
+                        code, now, "SELL",
+                        float(rich_in), float(trade_price), float(notional), float(fee),
+                        float(cash_after), float(pos_after)
+                    ),
                 )
 
-                self._touch_candle(now, self.price)
+                self._touch_candle_conn(conn, now, self.price)
                 self._set_pool_state()
-
-            conn.commit()
 
             return {
                 "ok": True,
@@ -542,17 +490,23 @@ class MarketEngine:
             conn.close()
 
     # ---------- Candle handling ----------
-    def _touch_candle(self, now_s: int, price: float) -> None:
+    def _touch_candle_conn(self, conn: sqlite3.Connection, now_s: int, price: float) -> None:
         cs = max(1, int(self.cfg.candle_seconds))
         ts_bucket = (now_s // cs) * cs
 
         if ts_bucket != self.candle_ts:
-            db.upsert_candle(
-                ts=int(self.candle_ts),
-                o=float(self.candle_o),
-                h=float(self.candle_h),
-                l=float(self.candle_l),
-                c=float(self.candle_c),
+            # persiste candle anterior (1 vez por segundo no máximo)
+            conn.execute(
+                """
+                INSERT INTO candles(ts, open, high, low, close)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(ts) DO UPDATE SET
+                  open=excluded.open,
+                  high=excluded.high,
+                  low=excluded.low,
+                  close=excluded.close
+                """,
+                (int(self.candle_ts), float(self.candle_o), float(self.candle_h), float(self.candle_l), float(self.candle_c)),
             )
             self.candle_ts = int(ts_bucket)
             self.candle_o = float(price)
@@ -565,6 +519,14 @@ class MarketEngine:
                 self.candle_h = float(price)
             if price < self.candle_l:
                 self.candle_l = float(price)
+
+    def _touch_candle(self, now_s: int, price: float) -> None:
+        # fallback (quando não temos conn)
+        conn = self._conn()
+        try:
+            self._touch_candle_conn(conn, now_s, price)
+        finally:
+            conn.close()
 
     # ---------- Loop (1s) ----------
     def _run_loop(self) -> None:
@@ -582,29 +544,28 @@ class MarketEngine:
 
     def _tick(self) -> None:
         """
-        Tick a cada 1s:
-          - NÃO mexe no preço.
-          - Garante candle "flat" mesmo sem trades.
+        Tick:
+          - NÃO mexe no preço
+          - mantém candle atualizado
         """
         now_s = int(time.time())
-
-        with self._lock:
-            self._touch_candle(now_s, float(self.price))
-            db.set_state(self.STATE_PRICE, str(self.price))
-            db.set_state(self.STATE_CANDLE_TS, str(self.candle_ts))
+        conn = self._conn()
+        try:
+            with self._lock:
+                self._touch_candle_conn(conn, now_s, float(self.price))
+                # estado leve
+                db.set_state(self.STATE_PRICE, str(self.price))
+                db.set_state(self.STATE_CANDLE_TS, str(self.candle_ts))
+        finally:
+            conn.close()
 
         if float(self.cfg.stopout_equity) > 0:
             self._liquidate_if_needed()
 
     def _liquidate_if_needed(self) -> None:
-        """
-        Stop-out simplificado (opcional).
-        """
         conn = self._conn()
         try:
-            rows = conn.execute(
-                "SELECT code, cash, pos FROM players WHERE pos != 0"
-            ).fetchall()
+            rows = conn.execute("SELECT code, cash, pos FROM players WHERE pos != 0").fetchall()
             if not rows:
                 return
 
@@ -637,24 +598,21 @@ class MarketEngine:
                         """,
                         (code, now, side, float(qty), float(mark), float(notional), 0.0, float(cash_after), float(pos_after)),
                     )
-
-            conn.commit()
         finally:
             conn.close()
 
 
 engine = MarketEngine(
     MarketConfig(
-        candle_seconds=1,            # 1s no DB (frontend agrega para 5m)
+        candle_seconds=1,
         tick_seconds=1.0,
         start_price=100.0,
         initial_usd_liquidity=2_000_000.0,
 
-
         seed_enabled=True,
-        seed_seconds=7 * 24 * 60 * 60,      # 1 semana
-        seed_candle_seconds=60,             # seed leve (1m)
-        seed_step_pct=0.0007,               # ajustável
+        seed_seconds=7 * 24 * 60 * 60,
+        seed_candle_seconds=60,
+        seed_step_pct=0.0007,
 
         fee_rate=0.0,
         min_equity=0.0,

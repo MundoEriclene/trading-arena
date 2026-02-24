@@ -4,6 +4,39 @@ function $(id) {
   return el;
 }
 
+// =====================================================
+// CONFIG: API BASE (Cloudflare Tunnel + Local)
+// =====================================================
+// Produção (recomendado): arena-api.blacknode.quest
+const PROD_API_BASE = "https://arena-api.blacknode.quest";
+
+// Você ainda pode sobrescrever sem mexer no código:
+// localStorage.setItem("arena_api_base", "https://arena-api.blacknode.quest");
+// localStorage.removeItem("arena_api_base");
+
+// Detecta automaticamente modo local:
+function isLocalHost() {
+  const h = String(location.hostname || "").toLowerCase();
+  return h === "localhost" || h === "127.0.0.1" || h.endsWith(".local");
+}
+
+const API_BASE = (() => {
+  const saved = (localStorage.getItem("arena_api_base") || "").trim();
+  if (saved) return saved.replace(/\/+$/, "");
+
+  // Se estiver rodando em localhost (dev), usa API local (mesmo host)
+  if (isLocalHost()) return "";
+
+  // Em produção (GitHub Pages / domínio), usa API do Cloudflare
+  return PROD_API_BASE.replace(/\/+$/, "");
+})();
+
+function apiUrl(path) {
+  const p = path.startsWith("/") ? path : `/${path}`;
+  if (!API_BASE) return p; // local (mesmo host/porta)
+  return `${API_BASE}${p}`;
+}
+
 // ===== Elements =====
 const elStatus = $("status");
 const elPrice  = $("price");
@@ -49,7 +82,13 @@ const phasePill = $("phasePill");
 // ===== Config =====
 const TF_SECONDS = 300;          // 5 minutos
 const CANDLES_LIMIT = 300;       // ~25h
+
+// Polling (leve para muitos users)
 const LIVE_POLL_MS = 1000;
+const ME_POLL_MS = 2000;
+const LB_POLL_MS = 5000;
+const TRADES_POLL_MS = 5000;
+const CANDLES_FULL_REFRESH_MS = 60000; // reload histórico no máximo 1x por minuto
 
 // ===== Helpers =====
 function setStatus(t){ if(elStatus) elStatus.textContent=t; }
@@ -124,23 +163,66 @@ function clearMe(){
   localStorage.removeItem("arena_nick");
 }
 
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+// =====================================================
+// API FETCH (sem preflight desnecessário)
+// - Só usa Content-Type JSON quando TEM body
+// =====================================================
 async function api(path, opts = {}) {
-  const r = await fetch(path, {
-    cache:"no-store",
-    headers:{ "Content-Type":"application/json" },
-    ...opts,
-  });
+  const controller = new AbortController();
+  const timeoutMs = opts.timeoutMs ?? 8000;
+  const t = setTimeout(() => controller.abort(), timeoutMs);
 
-  let data = null;
-  const ct = r.headers.get("content-type") || "";
-  if (ct.includes("application/json")) data = await r.json().catch(() => null);
-  else data = await r.text().catch(() => null);
+  const url = apiUrl(path);
 
-  if (!r.ok) {
-    const msg = (data && data.detail) ? data.detail : `Erro HTTP ${r.status}`;
-    throw new Error(msg);
+  // método default
+  const method = (opts.method || "GET").toUpperCase();
+
+  // headers: só JSON quando for POST/PUT/PATCH com body
+  const headers = new Headers(opts.headers || {});
+  const hasBody = opts.body != null && method !== "GET" && method !== "HEAD";
+
+  if (hasBody && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
   }
-  return data;
+
+  try {
+    const r = await fetch(url, {
+      cache: "no-store",
+      method,
+      headers,
+      signal: controller.signal,
+      body: hasBody ? opts.body : undefined,
+      // mantém os outros opts, mas sem sobrescrever o que definimos acima
+      ...(() => {
+        const { timeoutMs, retry, headers, body, method, ...rest } = opts;
+        return rest;
+      })()
+    });
+
+    let data = null;
+    const ct = r.headers.get("content-type") || "";
+    if (ct.includes("application/json")) data = await r.json().catch(() => null);
+    else data = await r.text().catch(() => null);
+
+    if (!r.ok) {
+      const msg = (data && data.detail) ? data.detail : `Erro HTTP ${r.status}`;
+      throw new Error(msg);
+    }
+
+    return data;
+  } catch (e) {
+    // retry leve apenas em falhas (timeout/rede)
+    const retries = Number.isFinite(opts.retry) ? Number(opts.retry) : 1;
+    if (retries > 0) {
+      await sleep(300);
+      return api(path, { ...opts, retry: retries - 1, timeoutMs });
+    }
+    throw e;
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 // ===== Modal =====
@@ -170,7 +252,7 @@ async function doJoin(){
       await toastErr("Campos obrigatórios", "Preencha <b>código</b> e <b>nick</b>.");
       return;
     }
-    await api("/api/join", { method:"POST", body: JSON.stringify({code,nick}) });
+    await api("/api/join", { method:"POST", body: JSON.stringify({code,nick}), timeoutMs: 8000, retry: 1 });
     setMe(code,nick);
     closeModal();
     renderMeIdentity();
@@ -196,10 +278,11 @@ else if (typeof chart.addSeries === "function") series = chart.addSeries(Lightwe
 else throw new Error("LightweightCharts incompatível.");
 
 let lastCandleTime = 0;
+let lastFullCandlesRefreshAt = 0;
 
 async function ensureMarketStarted(){
   try{
-    const st = await api("/api/state");
+    const st = await api("/api/state", { retry: 0, timeoutMs: 5000 });
     if (st && st.started) {
       if (phasePill) {
         phasePill.textContent = "LIVE";
@@ -210,7 +293,7 @@ async function ensureMarketStarted(){
   }catch(_e){}
 
   try{
-    const snap = await api("/api/start", { method:"POST" });
+    const snap = await api("/api/start", { method:"POST", body: JSON.stringify({}), retry: 0, timeoutMs: 7000 });
     if (snap && snap.started) {
       if (phasePill) {
         phasePill.textContent = "LIVE";
@@ -226,19 +309,20 @@ async function ensureMarketStarted(){
 
 async function loadCandles(){
   setStatus("carregando…");
-  const data = await api(`/api/candles?limit=${encodeURIComponent(CANDLES_LIMIT)}&tf=${encodeURIComponent(TF_SECONDS)}`);
+  const data = await api(`/api/candles?limit=${encodeURIComponent(CANDLES_LIMIT)}&tf=${encodeURIComponent(TF_SECONDS)}`, { retry: 0, timeoutMs: 12000 });
   if(!Array.isArray(data) || data.length === 0){ setStatus("sem dados"); return; }
   series.setData(data);
   setStatus("ok");
 
   const last = data[data.length-1];
   lastCandleTime = last.time;
+  lastFullCandlesRefreshAt = Date.now();
   setPriceTxt(px(last.close));
 }
 
 async function pollLiveCandle(){
   try{
-    const data = await api(`/api/candles?limit=2&tf=${encodeURIComponent(TF_SECONDS)}`);
+    const data = await api(`/api/candles?limit=2&tf=${encodeURIComponent(TF_SECONDS)}`, { retry: 0, timeoutMs: 5000 });
     if(!Array.isArray(data) || data.length === 0) return;
 
     const last = data[data.length-1];
@@ -246,7 +330,10 @@ async function pollLiveCandle(){
 
     if(last.time !== lastCandleTime){
       lastCandleTime = last.time;
-      await loadCandles(); // garante consistência quando vira candle
+      const now = Date.now();
+      if (now - lastFullCandlesRefreshAt >= CANDLES_FULL_REFRESH_MS) {
+        await loadCandles();
+      }
       return;
     }
 
@@ -292,7 +379,6 @@ function renderMeData(d){
   applyPnlStyle(elPnlRel, d.pnl_realized);
   applyPnlStyle(elPnlTot, d.pnl_total);
 
-  // Fechar posição só desabilita se FLAT
   if (btnCloseAll) btnCloseAll.disabled = (p.dir === "FLAT");
 }
 
@@ -308,14 +394,14 @@ async function refreshMe(){
     return;
   }
 
-  const data = await api(`/api/me?code=${encodeURIComponent(me.code)}`);
+  const data = await api(`/api/me?code=${encodeURIComponent(me.code)}`, { retry: 0, timeoutMs: 5000 });
   renderMeData(data);
 }
 
 async function refreshLeaderboard(){
   if(!elLeaderboard) return;
 
-  const rows = await api("/api/leaderboard?limit=50");
+  const rows = await api("/api/leaderboard?limit=50", { retry: 0, timeoutMs: 7000 });
   elLeaderboard.innerHTML = "";
 
   if(!Array.isArray(rows) || rows.length === 0){
@@ -355,7 +441,7 @@ async function refreshHistorySplit(){
     return;
   }
 
-  const rows = await api(`/api/trades?code=${encodeURIComponent(me.code)}&limit=80`);
+  const rows = await api(`/api/trades?code=${encodeURIComponent(me.code)}&limit=80`, { retry: 0, timeoutMs: 7000 });
   const buys = [];
   const sells = [];
 
@@ -368,7 +454,6 @@ async function refreshHistorySplit(){
   if(elBuysCount) elBuysCount.textContent = String(buys.length);
   if(elSellsCount) elSellsCount.textContent = String(sells.length);
 
-  // BUY list
   if (!buys.length) {
     if(elTradesBuys && elTradesBuysEmpty){ elTradesBuys.appendChild(elTradesBuysEmpty); elTradesBuysEmpty.style.display="block"; }
   } else {
@@ -381,7 +466,6 @@ async function refreshHistorySplit(){
     });
   }
 
-  // SELL list
   if (!sells.length) {
     if(elTradesSells && elTradesSellsEmpty){ elTradesSells.appendChild(elTradesSellsEmpty); elTradesSellsEmpty.style.display="block"; }
   } else {
@@ -418,9 +502,13 @@ async function doTrade(side){
       return;
     }
 
-    const res = await api("/api/trade", { method:"POST", body: JSON.stringify({ code: me.code, side, usd }) });
+    const res = await api("/api/trade", {
+      method:"POST",
+      body: JSON.stringify({ code: me.code, side, usd }),
+      timeoutMs: 12000,
+      retry: 0
+    });
 
-    // backend devolve res.me
     if (res && res.me) renderMeData(res.me);
 
     await Promise.allSettled([refreshLeaderboard(), refreshHistorySplit()]);
@@ -451,7 +539,7 @@ async function closePositionAll(){
     const me = getMe();
     if(!me.code){ openModal(); return; }
 
-    const m = await api(`/api/me?code=${encodeURIComponent(me.code)}`);
+    const m = await api(`/api/me?code=${encodeURIComponent(me.code)}`, { retry: 0, timeoutMs: 7000 });
     const pos = Number(m.pos)||0;
 
     if (Math.abs(pos) < 1e-12) {
@@ -463,15 +551,14 @@ async function closePositionAll(){
     const ok = await confirmBox("Fechar posição", `Deseja fechar 100% da posição (${p.label}) agora?`);
     if(!ok) return;
 
-    // 🔥 Fechar correto:
-    // LONG -> SELL usd equivalente
-    // SHORT -> BUY  usd equivalente
     const usdToClose = Math.abs(pos) * Number(m.price);
     const sideToClose = pos > 0 ? "SELL" : "BUY";
 
     await api("/api/trade", {
       method: "POST",
-      body: JSON.stringify({ code: me.code, side: sideToClose, usd: usdToClose })
+      body: JSON.stringify({ code: me.code, side: sideToClose, usd: usdToClose }),
+      timeoutMs: 12000,
+      retry: 0
     });
 
     await refreshAll();
@@ -536,14 +623,36 @@ function bindOtherEvents(){
   setupDelegation();
   bindOtherEvents();
 
+  // Status de conexão
+  if (API_BASE) setStatus(`conectando API…`);
+  else setStatus(`modo local…`);
+
+  // Health check (rápido)
+  try {
+    await api("/api/health", { retry: 1, timeoutMs: 4000 });
+    setStatus("✅ conectado");
+  } catch (_e) {
+    setStatus("⚠️ sem API");
+  }
+
   await ensureMarketStarted();
 
   renderMeIdentity();
   await loadCandles();
   await refreshAll();
 
+  // Loop leve
   setInterval(pollLiveCandle, LIVE_POLL_MS);
-  setInterval(refreshLeaderboard, 2000);
-  setInterval(refreshMe, 1000);
-  setInterval(refreshHistorySplit, 2000);
+
+  setInterval(() => {
+    const me = getMe();
+    if (me.code) refreshMe();
+  }, ME_POLL_MS);
+
+  setInterval(refreshLeaderboard, LB_POLL_MS);
+
+  setInterval(() => {
+    const me = getMe();
+    if (me.code) refreshHistorySplit();
+  }, TRADES_POLL_MS);
 })();

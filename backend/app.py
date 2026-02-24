@@ -3,9 +3,10 @@ import sqlite3
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Literal, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from backend import db
@@ -18,11 +19,39 @@ DB_FILE = APP_ROOT / "backend" / "db" / "game.db"
 
 INITIAL_CASH = 10_000.0
 
+# GitHub Pages (prod) + localhost (dev)
+ALLOWED_ORIGINS = [
+    "https://mundoericlene.github.io",
+    "https://mundoericlene.github.io/trading-arena",
+    "http://localhost",
+    "http://localhost:3000",
+    "http://127.0.0.1",
+    "http://127.0.0.1:3000",
+]
+
+# Cache simples para stats por jogador (evita recalcular toda hora lendo todos os trades)
+# Estrutura: code -> (last_trade_id, avg, realized, pos_at_calc)
+_STATS_CACHE: Dict[str, Tuple[int, float, float, float]] = {}
+_STATS_CACHE_TTL_SEC = 2.0
+_STATS_CACHE_TS: Dict[str, float] = {}
+
 
 # ---------- SQLite helpers ----------
 def _conn() -> sqlite3.Connection:
-    c = sqlite3.connect(DB_FILE)
+    # timeout + check_same_thread=False ajudam em concorrência (muitos requests)
+    c = sqlite3.connect(DB_FILE, timeout=30.0, check_same_thread=False)
     c.row_factory = sqlite3.Row
+
+    # PRAGMAs para reduzir travamentos e melhorar leitura concorrente
+    try:
+        c.execute("PRAGMA journal_mode=WAL;")
+        c.execute("PRAGMA synchronous=NORMAL;")
+        c.execute("PRAGMA temp_store=MEMORY;")
+        c.execute("PRAGMA busy_timeout=5000;")  # 5s
+    except Exception:
+        # se falhar por algum motivo, não derruba API
+        pass
+
     return c
 
 
@@ -77,7 +106,7 @@ def _list_trades_asc(code: str) -> List[Dict[str, Any]]:
     with _conn() as conn:
         rows = conn.execute(
             """
-            SELECT ts, side, qty, price, notional, fee
+            SELECT id, ts, side, qty, price, notional, fee
             FROM trades
             WHERE code = ?
             ORDER BY id ASC
@@ -85,6 +114,15 @@ def _list_trades_asc(code: str) -> List[Dict[str, Any]]:
             (code,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def _last_trade_id(code: str) -> int:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS last_id FROM trades WHERE code = ?",
+            (code,),
+        ).fetchone()
+        return int(row["last_id"] if row else 0)
 
 
 def _compute_stats_from_trades(code: str) -> Tuple[float, float, float]:
@@ -95,6 +133,16 @@ def _compute_stats_from_trades(code: str) -> Tuple[float, float, float]:
     avg_price = preço médio da posição atual (sempre >= 0)
     realized_pnl acumula ao reduzir/fechar posição
     """
+    # Cache por code (para leaderboard e /me não recalcularem toda hora)
+    now = time.time()
+    ttl_ok = (now - _STATS_CACHE_TS.get(code, 0.0)) <= _STATS_CACHE_TTL_SEC
+    last_id = _last_trade_id(code)
+
+    cached = _STATS_CACHE.get(code)
+    if ttl_ok and cached and cached[0] == last_id:
+        _, avg, realized, pos = cached
+        return float(avg), float(realized), float(pos)
+
     trades = _list_trades_asc(code)
 
     pos = 0.0
@@ -147,6 +195,8 @@ def _compute_stats_from_trades(code: str) -> Tuple[float, float, float]:
 
             realized -= fee
 
+    _STATS_CACHE[code] = (last_id, float(avg), float(realized), float(pos))
+    _STATS_CACHE_TS[code] = now
     return float(avg), float(realized), float(pos)
 
 
@@ -203,7 +253,28 @@ class TradeReq(BaseModel):
 # ---------- FastAPI ----------
 app = FastAPI(title="Trading Arena - AMM (Seed + Short)")
 
-app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
+# CORS obrigatório para GitHub Pages -> Tunnel (browser)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,  # sem cookies
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+    max_age=600,
+)
+
+# Static serve só para DEV local (não atrapalha prod)
+if FRONTEND_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
+
+
+@app.middleware("http")
+async def add_basic_headers(request: Request, call_next):
+    resp = await call_next(request)
+    # Segurança + evitar caching indevido de state/live
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.on_event("startup")
@@ -212,9 +283,21 @@ def on_startup():
     engine.start()
 
 
+# =========================================================
+# HEALTH
+# =========================================================
+@app.get("/api/health")
+def health():
+    # útil para testar o tunnel e uptime
+    return {"ok": True, "ts": int(time.time())}
+
+
 @app.get("/")
 def home():
-    return FileResponse(str(FRONTEND_DIR / "index.html"))
+    # útil só quando rodar tudo local (não é usado no GitHub Pages)
+    if (FRONTEND_DIR / "index.html").exists():
+        return FileResponse(str(FRONTEND_DIR / "index.html"))
+    return {"ok": True, "hint": "Frontend está no GitHub Pages. Use /api/* para dados."}
 
 
 @app.get("/favicon.ico")
@@ -264,7 +347,7 @@ def me(code: str):
     pos = float(p["pos"])
     equity = cash + pos * price
 
-    avg_price, pnl_realized, _ = _compute_stats_from_trades(code)
+    avg_price, pnl_realized, pos_calc = _compute_stats_from_trades(code)
 
     # unrealized (long ou short)
     if pos > 0 and avg_price > 0:
@@ -289,6 +372,7 @@ def me(code: str):
             "pnl_realized": pnl_realized,
             "pnl_unrealized": pnl_unrealized,
             "pnl_total": pnl_total,
+            "pos_calc": pos_calc,  # debug opcional (pode usar no front se quiser)
         }
     )
 
@@ -318,6 +402,9 @@ def trade(payload: TradeReq):
 
     if not res.get("ok"):
         raise HTTPException(status_code=400, detail=res.get("error", "Trade recusado"))
+
+    # invalida cache do jogador (garante stats atualizados logo após trade)
+    _STATS_CACHE_TS[code] = 0.0
 
     # devolve "me" atualizado para o frontend (PnL + equity)
     p2 = db.get_player(code)
@@ -369,9 +456,10 @@ def candles(limit: int = 200, tf: int = 300):
     limit = max(10, min(int(limit), 2000))
     tf = max(1, min(int(tf), 3600 * 24))
 
-    # buscamos suficiente (1s) e agregamos para tf
-    need_rows = limit * tf
-    need_rows = max(500, min(int(need_rows), 60000))
+    # evitar explodir DB: limita o quanto pode buscar
+    # regra: no máximo 60k linhas (já tinha), mas garantimos mínimo coerente
+    need_rows = int(limit * tf)
+    need_rows = max(500, min(need_rows, 60000))
 
     raw = _last_candles_raw(limit_rows=need_rows)
 
