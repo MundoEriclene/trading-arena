@@ -14,7 +14,7 @@ class MarketConfig:
     tick_seconds: float = 1.0
 
     start_price: float = 100.0
-    initial_usd_liquidity: float = 200_000.0
+    initial_usd_liquidity: float = 20_000_000
 
     seed_enabled: bool = True
     seed_seconds: int = 7 * 24 * 60 * 60
@@ -607,7 +607,7 @@ engine = MarketEngine(
         candle_seconds=1,
         tick_seconds=1.0,
         start_price=100.0,
-        initial_usd_liquidity=2_000_000_000.0,
+        initial_usd_liquidity=20_000_000,
 
         seed_enabled=True,
         seed_seconds=7 * 24 * 60 * 60,
